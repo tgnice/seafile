@@ -20,7 +20,7 @@ struct _FilelockMgrPriv {
 typedef struct _FilelockMgrPriv FilelockMgrPriv;
 
 typedef struct _LockInfo {
-    int dummy;
+    int locked_by_me;
 } LockInfo;
 
 struct _SeafFilelockManager *
@@ -53,9 +53,11 @@ load_locked_files (sqlite3_stmt *stmt, void *data)
 {
     GHashTable *repo_locked_files = data, *files;
     const char *repo_id, *path;
+    int locked_by_me;
 
     repo_id = sqlite3_column_text (stmt, 0);
     path = sqlite3_column_text (stmt, 1);
+    locked_by_me = sqlite3_column_int (stmt, 2);
 
     files = g_hash_table_lookup (repo_locked_files, repo_id);
     if (!files) {
@@ -65,6 +67,7 @@ load_locked_files (sqlite3_stmt *stmt, void *data)
 
     char *key = g_strdup(path);
     LockInfo *info = g_new0 (LockInfo, 1);
+    info->locked_by_me = locked_by_me;
     g_hash_table_replace (files, key, info);
 
     return TRUE;
@@ -84,7 +87,7 @@ seaf_filelock_manager_init (SeafFilelockManager *mgr)
     mgr->priv->db = db;
 
     sql = "CREATE TABLE IF NOT EXISTS ServerLockedFiles ("
-        "repo_id TEXT, path TEXT);";
+        "repo_id TEXT, path TEXT, locked_by_me INTEGER);";
     sqlite_query_exec (db, sql);
 
     sql = "CREATE INDEX IF NOT EXISTS server_locked_files_repo_id_idx "
@@ -95,7 +98,7 @@ seaf_filelock_manager_init (SeafFilelockManager *mgr)
         "repo_id TEXT, timestamp INTEGER, PRIMARY KEY (repo_id));";
     sqlite_query_exec (db, sql);
 
-    sql = "SELECT repo_id, path FROM ServerLockedFiles";
+    sql = "SELECT repo_id, path, locked_by_me FROM ServerLockedFiles";
 
     pthread_mutex_lock (&mgr->priv->db_lock);
     pthread_mutex_lock (&mgr->priv->hash_lock);
@@ -119,15 +122,18 @@ init_locks (gpointer key, gpointer value, gpointer user_data)
 {
     char *repo_id = user_data;
     char *path = key;
+    LockInfo *info = value;
 
-    seaf_sync_manager_update_active_path (seaf->sync_mgr,
-                                          repo_id,
-                                          path,
-                                          S_IFREG,
-                                          SYNC_STATUS_LOCKED);
-    seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
-                                        repo_id,
-                                        path);
+    if (!info->locked_by_me) {
+        seaf_sync_manager_update_active_path (seaf->sync_mgr,
+                                              repo_id,
+                                              path,
+                                              S_IFREG,
+                                              SYNC_STATUS_LOCKED);
+        seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
+                                            repo_id,
+                                            path);
+    }
 }
 
 int
@@ -157,6 +163,8 @@ seaf_filelock_manager_is_file_locked (SeafFilelockManager *mgr,
                                       const char *repo_id,
                                       const char *path)
 {
+    gboolean ret;
+
     pthread_mutex_lock (&mgr->priv->hash_lock);
 
     GHashTable *locks = g_hash_table_lookup (mgr->priv->repo_locked_files, repo_id);
@@ -165,7 +173,38 @@ seaf_filelock_manager_is_file_locked (SeafFilelockManager *mgr,
         return FALSE;
     }
 
-    gboolean ret = (g_hash_table_lookup (locks, path) != NULL);
+    LockInfo *info = g_hash_table_lookup (locks, path);
+    if (!info) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
+        return FALSE;
+    }
+    ret = !info->locked_by_me;
+
+    pthread_mutex_unlock (&mgr->priv->hash_lock);
+    return ret;
+}
+
+gboolean
+seaf_filelock_manager_is_file_locked_by_me (SeafFilelockManager *mgr,
+                                            const char *repo_id,
+                                            const char *path)
+{
+    gboolean ret;
+
+    pthread_mutex_lock (&mgr->priv->hash_lock);
+
+    GHashTable *locks = g_hash_table_lookup (mgr->priv->repo_locked_files, repo_id);
+    if (!locks) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
+        return FALSE;
+    }
+
+    LockInfo *info = g_hash_table_lookup (locks, path);
+    if (!info) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
+        return FALSE;
+    }
+    ret = info->locked_by_me;
 
     pthread_mutex_unlock (&mgr->priv->hash_lock);
     return ret;
@@ -181,7 +220,8 @@ seaf_filelock_manager_lock_wt_file (SeafFilelockManager *mgr,
         return;
 
     char *fullpath = g_build_filename (repo->worktree, path, NULL);
-    seaf_set_path_permission (fullpath, SEAF_PATH_PERM_RO, FALSE);
+    if (seaf_util_exists (fullpath))
+        seaf_set_path_permission (fullpath, SEAF_PATH_PERM_RO, FALSE);
     g_free (fullpath);
 }
 
@@ -197,9 +237,11 @@ seaf_filelock_manager_unlock_wt_file (SeafFilelockManager *mgr,
     char *fullpath = g_build_filename (repo->worktree, path, NULL);
 
 #ifdef WIN32
-    seaf_unset_path_permission (fullpath, FALSE);
+    if (seaf_util_exists (fullpath))
+        seaf_unset_path_permission (fullpath, FALSE);
 #else
-    seaf_set_path_permission (fullpath, SEAF_PATH_PERM_RW, FALSE);
+    if (seaf_util_exists (fullpath))
+        seaf_set_path_permission (fullpath, SEAF_PATH_PERM_RW, FALSE);
 #endif
     g_free (fullpath);
 }
@@ -225,13 +267,19 @@ update_in_memory (SeafFilelockManager *mgr, const char *repo_id, GHashTable *new
 
     GHashTableIter iter;
     gpointer key, value;
+    gpointer new_key, new_val;
     char *path;
     LockInfo *info;
+    gboolean exists;
+    int locked_by_me;
 
     g_hash_table_iter_init (&iter, locks);
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         path = key;
-        if (!g_hash_table_lookup (new_locks, path)) {
+        info = value;
+
+        exists = g_hash_table_lookup_extended (new_locks, path, &new_key, &new_val);
+        if (!exists) {
             seaf_sync_manager_update_active_path (seaf->sync_mgr,
                                                   repo_id,
                                                   path,
@@ -239,21 +287,50 @@ update_in_memory (SeafFilelockManager *mgr, const char *repo_id, GHashTable *new
                                                   SYNC_STATUS_SYNCED);
             seaf_filelock_manager_unlock_wt_file (mgr, repo_id, path);
             g_hash_table_iter_remove (&iter);
+        } else {
+            locked_by_me = (int)(long)new_val;
+            if (!info->locked_by_me && locked_by_me) {
+                seaf_sync_manager_update_active_path (seaf->sync_mgr,
+                                                      repo_id,
+                                                      path,
+                                                      S_IFREG,
+                                                      SYNC_STATUS_SYNCED);
+                seaf_filelock_manager_unlock_wt_file (mgr, repo_id, path);
+                info->locked_by_me = locked_by_me;
+            } else if (info->locked_by_me && !locked_by_me) {
+                seaf_sync_manager_update_active_path (seaf->sync_mgr,
+                                                      repo_id,
+                                                      path,
+                                                      S_IFREG,
+                                                      SYNC_STATUS_LOCKED);
+                seaf_filelock_manager_lock_wt_file (mgr, repo_id, path);
+                info->locked_by_me = locked_by_me;
+            }
         }
     }
 
     g_hash_table_iter_init (&iter, new_locks);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        path = key;
+    while (g_hash_table_iter_next (&iter, &new_key, &new_val)) {
+        path = new_key;
+        locked_by_me = (int)(long)new_val;
         if (!g_hash_table_lookup (locks, path)) {
             info = g_new0 (LockInfo, 1);
+            info->locked_by_me = locked_by_me;
             g_hash_table_insert (locks, g_strdup(path), info);
-            seaf_sync_manager_update_active_path (seaf->sync_mgr,
-                                                  repo_id,
-                                                  path,
-                                                  S_IFREG,
-                                                  SYNC_STATUS_LOCKED);
-            seaf_filelock_manager_lock_wt_file (mgr, repo_id, path);
+            if (!locked_by_me) {
+                seaf_sync_manager_update_active_path (seaf->sync_mgr,
+                                                      repo_id,
+                                                      path,
+                                                      S_IFREG,
+                                                      SYNC_STATUS_LOCKED);
+                seaf_filelock_manager_lock_wt_file (mgr, repo_id, path);
+            } else {
+                seaf_sync_manager_update_active_path (seaf->sync_mgr,
+                                                      repo_id,
+                                                      path,
+                                                      S_IFREG,
+                                                      SYNC_STATUS_SYNCED);
+            }
         }
     }
 
@@ -276,6 +353,7 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
     GHashTable *locks;
     GList *paths, *ptr;
     char *path;
+    LockInfo *info;
 
     pthread_mutex_lock (&mgr->priv->db_lock);
 
@@ -300,14 +378,16 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
     paths = g_hash_table_get_keys (locks);
     paths = g_list_sort (paths, compare_paths);
 
-    sql = "INSERT INTO ServerLockedFiles VALUES (?, ?)";
+    sql = "INSERT INTO ServerLockedFiles (repo_id, path, locked_by_me) VALUES (?, ?, ?)";
     stmt = sqlite_query_prepare (mgr->priv->db, sql);
 
     for (ptr = paths; ptr; ptr = ptr->next) {
         path = ptr->data;
+        info = g_hash_table_lookup (locks, path);
 
         sqlite3_bind_text (stmt, 1, repo_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int (stmt, 3, info->locked_by_me);
 
         if (sqlite3_step (stmt) != SQLITE_DONE) {
             seaf_warning ("Failed to insert server file lock for %.8s: %s.\n",
@@ -422,4 +502,64 @@ seaf_filelock_manager_remove (SeafFilelockManager *mgr,
     pthread_mutex_unlock (&mgr->priv->hash_lock);
 
     return 0;
+}
+
+static int
+mark_file_locked_in_db (SeafFilelockManager *mgr,
+                        const char *repo_id,
+                        const char *path)
+{
+    char *sql;
+    sqlite3_stmt *stmt;
+
+    pthread_mutex_lock (&mgr->priv->db_lock);
+
+    sql = "REPLACE INTO ServerLockedFiles (repo_id, path, locked_by_me) VALUES (?, ?, ?)";
+    stmt = sqlite_query_prepare (mgr->priv->db, sql);
+    sqlite3_bind_text (stmt, 1, repo_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 2, 1);
+    if (sqlite3_step (stmt) != SQLITE_DONE) {
+        seaf_warning ("Failed to update server locked files for %.8s: %s.\n",
+                      repo_id, sqlite3_errmsg (mgr->priv->db));
+        sqlite3_finalize (stmt);
+        pthread_mutex_unlock (&mgr->priv->db_lock);
+        return -1;
+    }
+    sqlite3_finalize (stmt);
+
+    pthread_mutex_unlock (&mgr->priv->db_lock);
+
+    return 0;
+}
+
+int
+seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
+                                        const char *repo_id,
+                                        const char *path)
+{
+    GHashTable *locks;
+    LockInfo *info;
+
+    pthread_mutex_lock (&mgr->priv->hash_lock);
+
+    locks = g_hash_table_lookup (mgr->priv->repo_locked_files, repo_id);
+    if (!locks) {
+        locks = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                       g_free, (GDestroyNotify)lock_info_free);
+        g_hash_table_insert (mgr->priv->repo_locked_files,
+                             g_strdup(repo_id), locks);
+    }
+
+    info = g_hash_table_lookup (locks, path);
+    if (!info) {
+        info = g_new0 (LockInfo, 1);
+        info->locked_by_me = 1;
+        g_hash_table_insert (locks, g_strdup(path), info);
+    } else
+        info->locked_by_me = 1;
+
+    pthread_mutex_unlock (&mgr->priv->hash_lock);
+
+    return mark_file_locked_in_db (mgr, repo_id, path);
 }

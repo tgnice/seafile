@@ -844,6 +844,32 @@ seafile_get_path_sync_status (const char *repo_id,
     return status;
 }
 
+int
+seafile_mark_file_locked (const char *repo_id, const char *path, GError **error)
+{
+    char *canon_path = NULL;
+    int len;
+    int ret;
+
+    if (!repo_id || !path) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Argument should not be null");
+        return -1;
+    }
+
+    if (*path == '/')
+        ++path;
+    canon_path = g_strdup(path);
+    len = strlen(canon_path);
+    if (canon_path[len-1] == '/')
+        canon_path[len-1] = 0;
+
+    ret = seaf_filelock_manager_mark_file_locked (seaf->filelock_mgr,
+                                                  repo_id, path);
+
+    g_free (canon_path);
+    return ret;
+}
+
 #endif  /* not define SEAFILE_SERVER */
 
 /*

@@ -2568,8 +2568,6 @@ check_server_locked_files_done (HttpLockedFiles *result, void *user_data)
 
     SyncInfo *info;
     GList *p;
-    GHashTable *new_locks;
-    char *file, *key;
     for (ptr = result->results; ptr; ptr = ptr->next) {
         locked_res = ptr->data;
 
@@ -2577,19 +2575,9 @@ check_server_locked_files_done (HttpLockedFiles *result, void *user_data)
         if (info->in_sync)
             continue;
 
-        new_locks = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
-
-        for (p = locked_res->locked_files; p; p = p->next) {
-            file = p->data;
-            key = g_strdup(file);
-            g_hash_table_replace (new_locks, key, key);
-        }
-
         seaf_filelock_manager_update (seaf->filelock_mgr,
                                       locked_res->repo_id,
-                                      new_locks);
-
-        g_hash_table_destroy (new_locks);
+                                      locked_res->locked_files);
 
         seaf_filelock_manager_update_timestamp (seaf->filelock_mgr,
                                                 locked_res->repo_id,
@@ -3216,6 +3204,7 @@ static char *path_status_tbl[] = {
     "ignored",
     "synced",
     "locked",
+    "locked_by_me",
     NULL,
 };
 
@@ -3255,6 +3244,14 @@ seaf_sync_manager_get_path_sync_status (SeafSyncManager *mgr,
     }
 
     pthread_mutex_unlock (&mgr->priv->paths_lock);
+
+    /* The locked_by_me status is just for display, internally we don't keep that
+     * status.
+     */
+    if (ret == SYNC_STATUS_SYNCED &&
+        seaf_filelock_manager_is_file_locked_by_me (seaf->filelock_mgr,
+                                                    repo_id, path))
+        ret = SYNC_STATUS_LOCKED_BY_ME;
 
 out:
     return g_strdup(path_status_tbl[ret]);

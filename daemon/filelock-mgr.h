@@ -27,6 +27,11 @@ seaf_filelock_manager_is_file_locked (SeafFilelockManager *mgr,
                                       const char *repo_id,
                                       const char *path);
 
+gboolean
+seaf_filelock_manager_is_file_locked_by_me (SeafFilelockManager *mgr,
+                                            const char *repo_id,
+                                            const char *path);
+
 /* Remove locking from the file on worktree */
 void
 seaf_filelock_manager_lock_wt_file (SeafFilelockManager *mgr,
@@ -56,5 +61,10 @@ seaf_filelock_manager_get_timestamp (SeafFilelockManager *mgr,
 int
 seaf_filelock_manager_remove (SeafFilelockManager *mgr,
                               const char *repo_id);
+
+int
+seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
+                                        const char *repo_id,
+                                        const char *path);
 
 #endif

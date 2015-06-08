@@ -211,7 +211,7 @@ typedef struct _HttpLockedFilesReq {
 typedef struct _HttpLockedFilesRes {
     char repo_id[37];
     gint64 timestamp;
-    GList *locked_files;
+    GHashTable *locked_files;   /* path -> by_me */
 } HttpLockedFilesRes;
 
 void

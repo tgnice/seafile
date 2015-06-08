@@ -95,6 +95,7 @@ enum _SyncStatus {
     SYNC_STATUS_IGNORED,
     SYNC_STATUS_SYNCED,
     SYNC_STATUS_LOCKED,
+    SYNC_STATUS_LOCKED_BY_ME,
     N_SYNC_STATUS,
 };
 typedef enum _SyncStatus SyncStatus;

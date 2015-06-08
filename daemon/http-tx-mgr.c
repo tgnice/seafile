@@ -1481,7 +1481,7 @@ http_locked_files_res_free (HttpLockedFilesRes *res)
     if (!res)
         return;
 
-    g_list_free_full (res->locked_files, g_free);
+    g_hash_table_destroy (res->locked_files);
     g_free (res);
 }
 
@@ -1496,17 +1496,34 @@ typedef struct {
     GList *results;
 } GetLockedFilesData;
 
-static GList *
+static GHashTable *
 parse_locked_file_list (json_t *array)
 {
-    GList *ret = NULL;
+    GHashTable *ret = NULL;
     size_t n, i;
-    json_t *string;
+    json_t *obj, *string, *integer;
+
+    ret = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+    if (!ret) {
+        return NULL;
+    }
 
     n = json_array_size (array);
     for (i = 0; i < n; ++i) {
-        string = json_array_get (array, i);
-        ret = g_list_append (ret, g_strdup(json_string_value(string)));
+        obj = json_array_get (array, i);
+        string = json_object_get (obj, "path");
+        if (!string) {
+            g_hash_table_destroy (ret);
+            return NULL;
+        }
+        integer = json_object_get (obj, "by_me");
+        if (!integer) {
+            g_hash_table_destroy (ret);
+            return NULL;
+        }
+        g_hash_table_insert (ret,
+                             g_strdup(json_string_value(string)),
+                             (void*)json_integer_value(integer));
     }
 
     return ret;
@@ -1566,6 +1583,10 @@ parse_locked_files (const char *rsp_content, int rsp_size, GetLockedFilesData *d
         }
 
         res->locked_files = parse_locked_file_list (member);
+        if (res->locked_files == NULL) {
+            ret = -1;
+            goto out;
+        }
 
         results = g_list_append (results, res);
     }
@@ -1655,6 +1676,7 @@ get_locked_files_thread (void *vdata)
         goto out;
 
     if (status == HTTP_OK) {
+        seaf_message ("%s\n", rsp_content);
         if (parse_locked_files (rsp_content, rsp_size, data) < 0)
             goto out;
         data->success = TRUE;
