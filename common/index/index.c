@@ -154,11 +154,8 @@ static int convert_from_disk(struct ondisk_cache_entry *ondisk, struct cache_ent
 
     hashcpy(ret->sha1, ondisk->sha1);
 
-    /*
-     * NEEDSWORK: If the original index is crafted, this copy could
-     * go unchecked.
-     */
     memcpy(ret->name, name, len + 1);
+    ret->name[0] = 0;
 
     *ce = ret;
 
@@ -196,11 +193,8 @@ static int convert_from_disk2(struct ondisk_cache_entry2 *ondisk, struct cache_e
 
     hashcpy(ret->sha1, ondisk->sha1);
 
-    /*
-     * NEEDSWORK: If the original index is crafted, this copy could
-     * go unchecked.
-     */
     memcpy(ret->name, name, len + 1);
+    ret->name[len] = 0;
 
     *ce = ret;
 
